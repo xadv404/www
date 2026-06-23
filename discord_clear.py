@@ -9,6 +9,11 @@ Utilise ce script à tes risques et périls. Ne partage jamais ton token.
 
 from __future__ import annotations
 
+# ── CONFIG — remplis puis lance : python3 discord_clear.py ──
+TOKEN = ""
+CHAT_ID = ""
+DELAY = 1.2
+
 import argparse
 import os
 import sys
@@ -18,8 +23,6 @@ from typing import Any
 import requests
 
 API_BASE = "https://discord.com/api/v10"
-DEFAULT_DELAY = 1.2  # secondes entre chaque suppression (safe pour éviter le 429)
-
 
 class DiscordClient:
     def __init__(self, token: str) -> None:
@@ -169,18 +172,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "channel_id",
-        help="ID du salon (clic droit sur le salon → Copier l'identifiant du salon)",
+        nargs="?",
+        default=CHAT_ID or None,
+        help="ID du salon (défaut : CHAT_ID en haut du fichier)",
     )
     parser.add_argument(
         "--token",
-        default=os.environ.get("DISCORD_TOKEN"),
-        help="Token utilisateur (ou variable DISCORD_TOKEN)",
+        default=TOKEN or os.environ.get("DISCORD_TOKEN"),
+        help="Token utilisateur (défaut : TOKEN en haut du fichier)",
     )
     parser.add_argument(
         "--delay",
         type=float,
-        default=DEFAULT_DELAY,
-        help=f"Délai entre chaque suppression en secondes (défaut: {DEFAULT_DELAY})",
+        default=DELAY,
+        help=f"Délai entre chaque suppression en secondes (défaut: {DELAY})",
     )
     parser.add_argument(
         "--max",
@@ -199,9 +204,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    if not args.channel_id:
+        print(
+            "Erreur : définis CHAT_ID en haut du fichier ou passe l'ID en argument.",
+            file=sys.stderr,
+        )
+        return 1
+
     if not args.token:
         print(
-            "Erreur : fournis un token via --token ou la variable DISCORD_TOKEN.",
+            "Erreur : définis TOKEN en haut du fichier, ou --token, ou DISCORD_TOKEN.",
             file=sys.stderr,
         )
         return 1
