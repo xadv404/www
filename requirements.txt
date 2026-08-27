@@ -1,0 +1,2 @@
+# No external dependencies — uses only Python standard library (3.11+)
+# imaplib, ssl, socket, concurrent.futures, argparse, re, pathlib
