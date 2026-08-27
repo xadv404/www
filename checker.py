@@ -20,6 +20,8 @@ import socket
 import re
 import os
 import time
+import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -47,6 +49,30 @@ def cprint(*args, **kwargs):
 
 # ── Provider detection ────────────────────────────────────────────────────────
 
+_tb_cache: dict[str, dict] = {}
+
+
+def _thunderbird_fetch(domain: str, timeout: int = 5) -> dict:
+    """Query Mozilla ISPDB and cache both IMAP and POP3 configs for a domain."""
+    if domain in _tb_cache:
+        return _tb_cache[domain]
+    result: dict = {"imap": None, "pop3": None}
+    try:
+        url = f"https://autoconfig.thunderbird.net/v1.1/{domain}"
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            root = ET.fromstring(resp.read())
+        for server in root.iter("incomingServer"):
+            stype = server.get("type")
+            host = server.findtext("hostname")
+            port_str = server.findtext("port")
+            if host and port_str and stype in ("imap", "pop3") and result[stype] is None:
+                result[stype] = {"host": host, "port": int(port_str)}
+    except Exception:
+        pass
+    _tb_cache[domain] = result
+    return result
+
+
 def resolve_fallback(domain: str, port: int = 993, timeout: int = 5):
     """Try common hostname patterns until one resolves via DNS."""
     for pattern in FALLBACK_PATTERNS:
@@ -61,10 +87,13 @@ def resolve_fallback(domain: str, port: int = 993, timeout: int = 5):
 
 
 def get_imap_config(email_addr: str, dns_timeout: int = 5):
-    """Return IMAP config dict for the given email, or None if unknown."""
+    """Return (domain, imap_cfg | None). Detection order: known DB → Thunderbird → DNS."""
     domain = email_addr.split("@")[-1].lower().strip()
     if domain in KNOWN_PROVIDERS:
         return domain, KNOWN_PROVIDERS[domain]
+    tb = _thunderbird_fetch(domain)
+    if tb["imap"]:
+        return domain, tb["imap"]
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(dns_timeout)
     try:
@@ -109,9 +138,12 @@ def _is_imap_disabled(err: str) -> bool:
 
 
 def _pop3_host(imap_host: str, domain: str) -> str | None:
-    """Derive a POP3 hostname from the IMAP hostname, or None to skip."""
+    """Return POP3 hostname: Thunderbird cache first, then derivation, or None to skip."""
     if "office365" in imap_host or "outlook.com" in imap_host:
         return None  # Microsoft disabled basic auth on POP3 too
+    tb = _tb_cache.get(domain)
+    if tb and tb.get("pop3"):
+        return tb["pop3"]["host"]
     if imap_host.startswith("imap."):
         return "pop3." + imap_host[5:]
     if imap_host.startswith("imap"):
