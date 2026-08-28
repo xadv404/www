@@ -1,0 +1,3 @@
+user1@orange.fr:password123
+user2@orange.fr:mypass456
+test@orange.fr:secret789
